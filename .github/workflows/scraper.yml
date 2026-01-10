@@ -1,32 +1,26 @@
 name: PAO BC Calendar Scraper
-
 on:
   schedule:
     # Τρέχει κάθε μέρα στις 08:00 UTC (10:00 ώρα Ελλάδας)
     - cron: '0 8 * * *'
   workflow_dispatch:  # Επιτρέπει manual trigger
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        
     - name: Install dependencies
       run: |
         pip install requests beautifulsoup4 google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
-        
     - name: Create credentials file
       run: |
         echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
-        
+        echo '${{ secrets.GOOGLE_TOKEN }}' | base64 -d > token.pickle
     - name: Run scraper
       env:
         CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
