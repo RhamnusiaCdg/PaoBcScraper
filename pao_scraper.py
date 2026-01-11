@@ -8,12 +8,27 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import re
+import logging
+import sys
 
+# ==========================================================
+# LOGGING SETUP
+# ==========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================================
+# ENVIRONMENT SETUP
+# ==========================================================
 # Προαιρετικά: Φόρτωσε .env αρχείο για local development
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except ImportError:
     pass  # Δεν υπάρχει python-dotenv, χρησιμοποίησε system env vars
@@ -21,32 +36,42 @@ except ImportError:
 # ==========================================================
 # ΡΥΘΜΙΣΕΙΣ
 # ==========================================================
-# Βάλε εδώ το δικό σου Calendar ID (ή χρησιμοποίησε environment variable)
 CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 BASE_URL = "https://www.paobc.gr/schedule/page/"
+MAX_PAGES = 10  # Safety limit - θα σταματήσει νωρίτερα αν δεν βρει αγώνες
+REQUEST_TIMEOUT = 15  # seconds
 
 
 def authenticate_google_calendar():
     """Authenticate and return Google Calendar service"""
+    logger.info("Έλεγχος ταυτότητας Google Calendar...")
     creds = None
 
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
+    try:
+        if os.path.exists("token.pickle"):
+            with open("token.pickle", "rb") as token:
+                creds = pickle.load(token)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=False)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                logger.info("Ανανέωση token...")
+                creds.refresh(Request())
+            else:
+                logger.info("Νέο OAuth flow...")
+                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                creds = flow.run_local_server(port=0, open_browser=False)
 
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
+            with open("token.pickle", "wb") as token:
+                pickle.dump(creds, token)
 
-    service = build("calendar", "v3", credentials=creds)
-    return service
+        service = build("calendar", "v3", credentials=creds)
+        logger.info("✓ Επιτυχής ταυτοποίηση")
+        return service
+
+    except Exception as e:
+        logger.error(f"Σφάλμα ταυτοποίησης: {e}")
+        sys.exit(1)
 
 
 def scrape_pao_schedule():
@@ -54,18 +79,21 @@ def scrape_pao_schedule():
     all_matches = []
     seen_matches = set()  # Track unique matches
     page = 1
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    consecutive_empty_pages = 0  # Track empty pages to stop early
 
-    while True:
+    logger.info(f"Έναρξη σάρωσης από {BASE_URL}")
+
+    while page <= MAX_PAGES:
         if page == 1:
             url = "https://www.paobc.gr/schedule/"
         else:
             url = f"{BASE_URL}{page}/"
 
-        print(f"Σάρωση σελίδας {page}: {url}")
+        logger.info(f"Σάρωση σελίδας {page}: {url}")
 
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.content, "html.parser")
@@ -74,14 +102,29 @@ def scrape_pao_schedule():
             matches = soup.find_all("div", class_="game")
 
             if not matches:
-                print(f"Δεν βρέθηκαν αγώνες στη σελίδα {page}")
-                break
+                consecutive_empty_pages += 1
+                logger.warning(f"Δεν βρέθηκαν αγώνες στη σελίδα {page}")
+                
+                # Αν δεν βρούμε αγώνες σε 2 συνεχόμενες σελίδες, σταματάμε
+                if consecutive_empty_pages >= 2:
+                    logger.info(f"Τερματισμός: {consecutive_empty_pages} συνεχόμενες κενές σελίδες")
+                    break
+                
+                page += 1
+                continue
+            
+            # Reset counter when we find matches
+            consecutive_empty_pages = 0
+            matches_on_page = 0
 
             for match in matches:
                 try:
                     # Extract match details
                     data_div = match.find("div", class_="game__data")
                     header_div = match.find("div", class_="game__header")
+
+                    if not data_div or not header_div:
+                        continue
 
                     # Get competition
                     competition = data_div.find(
@@ -117,9 +160,7 @@ def scrape_pao_schedule():
 
                     # Skip if we've already seen this exact match
                     if match_id in seen_matches:
-                        print(
-                            f"⏭️ Παράλειψη διπλότυπου: {home_team} vs {away_team} στις {date_text}"
-                        )
+                        logger.debug(f"⏭️ Παράλειψη διπλότυπου: {home_team} vs {away_team}")
                         continue
 
                     seen_matches.add(match_id)
@@ -134,22 +175,31 @@ def scrape_pao_schedule():
                     }
 
                     all_matches.append(match_data)
-                    print(f"Βρέθηκε: {home_team} vs {away_team} στις {date_text}")
+                    matches_on_page += 1
+                    logger.debug(f"Βρέθηκε: {home_team} vs {away_team} στις {date_text}")
 
                 except AttributeError as e:
-                    print(f"Σφάλμα ανάλυσης αγώνα: {e}")
+                    logger.warning(f"Σφάλμα ανάλυσης αγώνα: {e}")
                     continue
 
+            logger.info(f"✓ Σελίδα {page}: {matches_on_page} αγώνες")
             page += 1
 
-            # Stop after 5 pages to avoid too many requests
-            if page > 5:
-                break
-
+        except requests.Timeout:
+            logger.error(f"Timeout στη σελίδα {page} - Προσπαθούμε την επόμενη...")
+            page += 1
+            continue
         except requests.RequestException as e:
-            print(f"Σφάλημα φόρτωσης σελίδας {page}: {e}")
-            break
+            logger.error(f"Σφάλμα δικτύου στη σελίδα {page}: {e}")
+            # Αν αποτύχει το request, προσπαθούμε να συνεχίσουμε με όσα έχουμε
+            if all_matches:
+                logger.warning(f"Συνέχεια με {len(all_matches)} αγώνες που βρέθηκαν μέχρι τώρα")
+                break
+            else:
+                logger.error("Κρίσιμο σφάλμα: Δεν βρέθηκαν αγώνες")
+                sys.exit(1)
 
+    logger.info(f"📊 Σύνολο: {len(all_matches)} μοναδικοί αγώνες από {page-1} σελίδες")
     return all_matches
 
 
@@ -270,7 +320,7 @@ def parse_match_datetime(date_text, time_text):
         return None
 
     except Exception as e:
-        print(f"Σφάλμα ανάλυσης ημερομηνίας '{date_text} {time_text}': {e}")
+        logger.warning(f"Σφάλμα ανάλυσης ημερομηνίας '{date_text} {time_text}': {e}")
         return None
 
 
@@ -286,7 +336,7 @@ def add_or_update_match(service, match_data, existing_calendar_events):
         match_datetime = parse_match_datetime(match_data["date"], match_data["time"])
 
         if not match_datetime:
-            print(f"Παράλειψη αγώνα λόγω σφάλματος ημερομηνίας: {match_data}")
+            logger.warning(f"Παράλειψη αγώνα λόγω σφάλματος ημερομηνίας: {match_data['home_team']} vs {match_data['away_team']}")
             return None
 
         # Create unique key for this match
@@ -321,9 +371,7 @@ def add_or_update_match(service, match_data, existing_calendar_events):
                     # Check if time changed
                     if existing_dt.time() == match_datetime.time():
                         # Same time - no update needed
-                        print(
-                            f"ℹ️ ΥΠΑΡΧΕΙ ΗΔΗ: {summary} ({match_datetime.strftime('%d/%m/%Y %H:%M')})"
-                        )
+                        logger.debug(f"ℹ️ Υπάρχει ήδη: {summary}")
                         return match_key
                     else:
                         # Time changed - need to update
@@ -359,20 +407,20 @@ def add_or_update_match(service, match_data, existing_calendar_events):
             service.events().update(
                 calendarId=CALENDAR_ID, eventId=event_to_update["id"], body=event
             ).execute()
-            print(
-                f"🔄 ΕΝΗΜΕΡΩΣΗ ΩΡΑ: {summary} ({existing_time} → {match_datetime.strftime('%H:%M')})"
+            logger.info(
+                f"🔄 ΕΝΗΜΕΡΩΣΗ: {match_data['home_team']} vs {match_data['away_team']} ({existing_time} → {match_datetime.strftime('%H:%M')})"
             )
         else:
             # Insert new event
             service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-            print(
-                f"✅ ΠΡΟΣΤΕΘΗΚΕ: {summary} ({match_datetime.strftime('%d/%m/%Y %H:%M')})"
+            logger.info(
+                f"✅ ΠΡΟΣΘΗΚΗ: {match_data['home_team']} vs {match_data['away_team']} ({match_datetime.strftime('%d/%m/%Y %H:%M')})"
             )
 
         return match_key
 
     except Exception as e:
-        print(f"Σφάλμα προσθήκης αγώνα στο ημερολόγιο: {e}")
+        logger.error(f"Σφάλμα προσθήκης αγώνα στο ημερολόγιο: {e}")
         return None
 
 
@@ -384,9 +432,7 @@ def get_all_pao_events(service):
         time_min = (datetime.now() - timedelta(days=180)).isoformat() + "Z"
         time_max = (datetime.now() + timedelta(days=540)).isoformat() + "Z"
 
-        print(
-            f"   Αναζήτηση από {(datetime.now() - timedelta(days=180)).strftime('%d/%m/%Y')} έως {(datetime.now() + timedelta(days=540)).strftime('%d/%m/%Y')}"
-        )
+        logger.info(f"Αναζήτηση events από {(datetime.now() - timedelta(days=180)).strftime('%d/%m/%Y')} έως {(datetime.now() + timedelta(days=540)).strftime('%d/%m/%Y')}")
 
         events_result = (
             service.events()
@@ -394,7 +440,7 @@ def get_all_pao_events(service):
                 calendarId=CALENDAR_ID,
                 timeMin=time_min,
                 timeMax=time_max,
-                maxResults=2500,  # Αυξάνουμε το όριο
+                maxResults=2500,
                 singleEvents=True,
                 orderBy="startTime",
             )
@@ -415,10 +461,11 @@ def get_all_pao_events(service):
             ):
                 pao_events.append(event)
 
+        logger.info(f"✓ Βρέθηκαν {len(pao_events)} PAO basketball events στο ημερολόγιο")
         return pao_events
 
     except Exception as e:
-        print(f"Σφάλμα ανάκτησης events από ημερολόγιο: {e}")
+        logger.error(f"Σφάλμα ανάκτησης events από ημερολόγιο: {e}")
         return []
 
 
@@ -464,13 +511,13 @@ def delete_obsolete_events(service, valid_match_keys, calendar_events):
                         service.events().delete(
                             calendarId=CALENDAR_ID, eventId=event["id"]
                         ).execute()
-                        print(
-                            f"🗑️ ΔΙΑΓΡΑΦΗ (δεν υπάρχει πια): {summary} ({existing_dt.strftime('%d/%m/%Y %H:%M')})"
+                        logger.info(
+                            f"🗑️ ΔΙΑΓΡΑΦΗ: {home_team} vs {away_team} ({existing_dt.strftime('%d/%m/%Y')}) - δεν υπάρχει πια στο site"
                         )
                         deleted_count += 1
 
         except Exception as e:
-            print(f"⚠️ Σφάλμα διαγραφής event: {e}")
+            logger.warning(f"Σφάλμα διαγραφής event: {e}")
             continue
 
     return deleted_count
@@ -478,30 +525,34 @@ def delete_obsolete_events(service, valid_match_keys, calendar_events):
 
 def main():
     """Main function with 2-phase sync"""
-    print("🏀 Έναρξη Panathinaikos BC Schedule Scraper...")
-    print("=" * 60)
+    logger.info("=" * 70)
+    logger.info("🏀 Panathinaikos BC Schedule Scraper - Έναρξη")
+    logger.info("=" * 70)
 
     # Authenticate Google Calendar
-    print("🔐 Έλεγχος ταυτότητας Google Calendar...")
     service = authenticate_google_calendar()
 
     # PHASE 0: Get existing calendar events
-    print("📅 Ανάκτηση υπαρχόντων events από ημερολόγιο...")
+    logger.info("\n📅 ΦΑΣΗ 0: Ανάκτηση υπαρχόντων events...")
+    logger.info("-" * 70)
     existing_calendar_events = get_all_pao_events(service)
-    print(f"   Βρέθηκαν {len(existing_calendar_events)} υπάρχοντα events")
 
     # PHASE 1: Scrape schedule from website
-    print(f"\n🌐 Σάρωση προγράμματος από {BASE_URL}...")
+    logger.info(f"\n🌐 ΦΑΣΗ 1: Σάρωση προγράμματος από paobc.gr...")
+    logger.info("-" * 70)
     matches = scrape_pao_schedule()
 
-    print("=" * 60)
-    print(f"📊 Βρέθηκαν {len(matches)} αγώνες στο site\n")
+    if not matches:
+        logger.error("❌ Δεν βρέθηκαν αγώνες - τερματισμός")
+        sys.exit(1)
 
     # PHASE 2: Add/update matches from website
-    print("🔄 ΦΑΣΗ 1: Συγχρονισμός αγώνων από το site...")
-    print("-" * 60)
+    logger.info(f"\n🔄 ΦΑΣΗ 2: Συγχρονισμός {len(matches)} αγώνων με το ημερολόγιο...")
+    logger.info("-" * 70)
 
     processed_count = 0
+    added_count = 0
+    updated_count = 0
     valid_match_keys = set()
 
     for match in matches:
@@ -511,19 +562,29 @@ def main():
             processed_count += 1
 
     # PHASE 3: Delete events that no longer exist on website
-    print("\n🗑️ ΦΑΣΗ 2: Διαγραφή αγώνων που δεν υπάρχουν πια στο site...")
-    print("-" * 60)
+    logger.info(f"\n🗑️ ΦΑΣΗ 3: Έλεγχος για αγώνες προς διαγραφή...")
+    logger.info("-" * 70)
 
     deleted_count = delete_obsolete_events(
         service, valid_match_keys, existing_calendar_events
     )
 
-    print("\n" + "=" * 60)
-    print(f"✅ Ολοκληρώθηκε!")
-    print(f"   • Επεξεργάστηκαν: {processed_count} αγώνες")
-    print(f"   • Διαγράφηκαν: {deleted_count} (ακυρώθηκαν/μετακινήθηκαν)")
-    print("=" * 60)
+    # Summary
+    logger.info("\n" + "=" * 70)
+    logger.info("✅ ΟΛΟΚΛΗΡΩΘΗΚΕ ΕΠΙΤΥΧΩΣ!")
+    logger.info(f"   • Αγώνες στο site: {len(matches)}")
+    logger.info(f"   • Επεξεργάστηκαν: {processed_count}")
+    logger.info(f"   • Διαγράφηκαν: {deleted_count} (ακυρώθηκαν/μετακινήθηκαν)")
+    logger.info(f"   • Τρέχοντα events στο ημερολόγιο: {len(existing_calendar_events) - deleted_count + (processed_count if processed_count > len(existing_calendar_events) else 0)}")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("\n⚠️ Διακόπηκε από τον χρήστη")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"\n❌ Κρίσιμο σφάλμα: {e}", exc_info=True)
+        sys.exit(1)
