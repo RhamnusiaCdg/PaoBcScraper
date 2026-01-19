@@ -2,8 +2,8 @@ name: PAO BC Scraper (Service Account)
 
 on:
   schedule:
-    # Τρέχει κάθε 6 ώρες
-    - cron: '0 */6 * * *'
+    # Τρέχει 1 φορά την ημέρα στις 08:00 UTC (10:00 ώρα Ελλάδας)
+    - cron: '0 8 * * *'
   
   # Επιτρέπει manual trigger από το GitHub UI
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
     - name: Run PAO BC Scraper
       env:
         SERVICE_ACCOUNT_KEY: ${{ secrets.SERVICE_ACCOUNT_KEY }}
-        CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+        CALENDAR_ID: primary
       run: |
         python pao_scraper.py
     
