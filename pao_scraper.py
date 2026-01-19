@@ -1,15 +1,13 @@
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-import pickle
+import json
+import base64
 import os
-import os.path
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+import sys
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import logging
-import sys
 
 # ==========================================================
 # LOGGING SETUP
@@ -17,21 +15,18 @@ import sys
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 # ==========================================================
 # ENVIRONMENT SETUP
 # ==========================================================
-# Προαιρετικά: Φόρτωσε .env αρχείο για local development
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # Δεν υπάρχει python-dotenv, χρησιμοποίησε system env vars
+    pass
 
 # ==========================================================
 # ΡΥΘΜΙΣΕΙΣ
@@ -39,48 +34,63 @@ except ImportError:
 CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 BASE_URL = "https://www.paobc.gr/schedule/page/"
-MAX_PAGES = 10  # Safety limit - θα σταματήσει νωρίτερα αν δεν βρει αγώνες
-REQUEST_TIMEOUT = 15  # seconds
+MAX_PAGES = 10
+REQUEST_TIMEOUT = 15
 
 
 def authenticate_google_calendar():
-    """Authenticate and return Google Calendar service"""
-    logger.info("Έλεγχος ταυτότητας Google Calendar...")
-    creds = None
-
+    """
+    Authenticate with Google Calendar using Service Account
+    ΔΕΝ χρειάζεται ΠΟΤΕ ανανέωση token!
+    """
+    logger.info("Έλεγχος ταυτότητας Google Calendar (Service Account)...")
+    
     try:
-        if os.path.exists("token.pickle"):
-            with open("token.pickle", "rb") as token:
-                creds = pickle.load(token)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                logger.info("Ανανέωση token...")
-                creds.refresh(Request())
-            else:
-                logger.info("Νέο OAuth flow...")
-                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-                creds = flow.run_local_server(port=0, open_browser=False)
-
-            with open("token.pickle", "wb") as token:
-                pickle.dump(creds, token)
-
-        service = build("calendar", "v3", credentials=creds)
-        logger.info("✓ Επιτυχής ταυτοποίηση")
+        # Προσπάθεια φόρτωσης από environment variable (GitHub Actions)
+        if os.getenv('SERVICE_ACCOUNT_KEY'):
+            logger.info("Φόρτωση credentials από environment variable")
+            service_account_info = json.loads(
+                base64.b64decode(os.getenv('SERVICE_ACCOUNT_KEY'))
+            )
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info,
+                scopes=SCOPES
+            )
+        
+        # Προσπάθεια φόρτωσης από αρχείο (local development)
+        elif os.path.exists('service-account-key.json'):
+            logger.info("Φόρτωση credentials από αρχείο")
+            credentials = service_account.Credentials.from_service_account_file(
+                'service-account-key.json',
+                scopes=SCOPES
+            )
+        
+        else:
+            raise FileNotFoundError(
+                "Δεν βρέθηκαν service account credentials! "
+                "Βάλε το service-account-key.json στο directory ή "
+                "όρισε το SERVICE_ACCOUNT_KEY environment variable"
+            )
+        
+        service = build("calendar", "v3", credentials=credentials)
+        logger.info("✓ Επιτυχής ταυτοποίηση με Service Account")
         return service
-
+        
+    except FileNotFoundError as e:
+        logger.error(f"❌ {e}")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Σφάλμα ταυτοποίησης: {e}")
+        logger.error(f"❌ Σφάλμα ταυτοποίησης: {e}")
         sys.exit(1)
 
 
 def scrape_pao_schedule():
     """Scrape Panathinaikos BC schedule from all pages"""
     all_matches = []
-    seen_matches = set()  # Track unique matches
+    seen_matches = set()
     page = 1
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    consecutive_empty_pages = 0  # Track empty pages to stop early
+    consecutive_empty_pages = 0
 
     logger.info(f"Έναρξη σάρωσης από {BASE_URL}")
 
@@ -97,15 +107,12 @@ def scrape_pao_schedule():
             response.raise_for_status()
 
             soup = BeautifulSoup(response.content, "html.parser")
-
-            # Find all game divs
             matches = soup.find_all("div", class_="game")
 
             if not matches:
                 consecutive_empty_pages += 1
                 logger.warning(f"Δεν βρέθηκαν αγώνες στη σελίδα {page}")
                 
-                # Αν δεν βρούμε αγώνες σε 2 συνεχόμενες σελίδες, σταματάμε
                 if consecutive_empty_pages >= 2:
                     logger.info(f"Τερματισμός: {consecutive_empty_pages} συνεχόμενες κενές σελίδες")
                     break
@@ -113,52 +120,34 @@ def scrape_pao_schedule():
                 page += 1
                 continue
             
-            # Reset counter when we find matches
             consecutive_empty_pages = 0
             matches_on_page = 0
 
             for match in matches:
                 try:
-                    # Extract match details
                     data_div = match.find("div", class_="game__data")
                     header_div = match.find("div", class_="game__header")
 
                     if not data_div or not header_div:
                         continue
 
-                    # Get competition
-                    competition = data_div.find(
-                        "div", class_="game__data__league"
-                    ).text.strip()
+                    competition = data_div.find("div", class_="game__data__league").text.strip()
 
-                    # Get date and time
                     date_div = data_div.find("div", class_="game__data__date")
                     date_spans = date_div.find_all("span")
-                    date_text = (
-                        date_spans[0].text.strip() if len(date_spans) > 0 else ""
-                    )
-                    time_text = (
-                        date_spans[1].text.strip() if len(date_spans) > 1 else ""
-                    )
+                    date_text = date_spans[0].text.strip() if len(date_spans) > 0 else ""
+                    time_text = date_spans[1].text.strip() if len(date_spans) > 1 else ""
 
-                    # Get venue
                     venue_div = data_div.find("div", class_="game__data__stadium")
                     venue = venue_div.text.strip() if venue_div else "ΟΑΚΑ"
 
-                    # Get teams
                     name_div = header_div.find("div", class_="game__header__name")
                     team_spans = name_div.find_all("span")
-                    home_team = (
-                        team_spans[0].text.strip() if len(team_spans) > 0 else ""
-                    )
-                    away_team = (
-                        team_spans[1].text.strip() if len(team_spans) > 1 else ""
-                    )
+                    home_team = team_spans[0].text.strip() if len(team_spans) > 0 else ""
+                    away_team = team_spans[1].text.strip() if len(team_spans) > 1 else ""
 
-                    # Create unique identifier to detect duplicates
                     match_id = f"{home_team}|{away_team}|{date_text}"
 
-                    # Skip if we've already seen this exact match
                     if match_id in seen_matches:
                         logger.debug(f"⏭️ Παράλειψη διπλότυπου: {home_team} vs {away_team}")
                         continue
@@ -191,7 +180,6 @@ def scrape_pao_schedule():
             continue
         except requests.RequestException as e:
             logger.error(f"Σφάλμα δικτύου στη σελίδα {page}: {e}")
-            # Αν αποτύχει το request, προσπαθούμε να συνεχίσουμε με όσα έχουμε
             if all_matches:
                 logger.warning(f"Συνέχεια με {len(all_matches)} αγώνες που βρέθηκαν μέχρι τώρα")
                 break
@@ -206,112 +194,64 @@ def scrape_pao_schedule():
 def parse_match_datetime(date_text, time_text):
     """Parse date/time to datetime object"""
     try:
-        # Greek day names to remove
         greek_days = [
-            "Δευτέρα",
-            "Τρίτη",
-            "Τετάρτη",
-            "Πέμπτη",
-            "Παρασκευή",
-            "Σάββατο",
-            "Κυριακή",
+            "Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", 
+            "Παρασκευή", "Σάββατο", "Κυριακή"
         ]
 
-        # Remove Greek day names
         for day in greek_days:
             date_text = date_text.replace(day + ",", "").replace(day, "")
 
-        # Greek month mapping
         greek_months = {
-            "Ιανουαρίου": "January",
-            "Ιαν": "January",
-            "Φεβρουαρίου": "February",
-            "Φεβ": "February",
-            "Μαρτίου": "March",
-            "Μαρ": "March",
-            "Απριλίου": "April",
-            "Απρ": "April",
-            "Μαΐου": "May",
-            "Μάι": "May",
-            "Ιουνίου": "June",
-            "Ιουν": "June",
-            "Ιουλίου": "July",
-            "Ιουλ": "July",
-            "Αυγούστου": "August",
-            "Αυγ": "August",
-            "Σεπτεμβρίου": "September",
-            "Σεπ": "September",
-            "Οκτωβρίου": "October",
-            "Οκτ": "October",
-            "Νοεμβρίου": "November",
-            "Νοε": "November",
-            "Δεκεμβρίου": "December",
-            "Δεκ": "December",
+            "Ιανουαρίου": "January", "Ιαν": "January",
+            "Φεβρουαρίου": "February", "Φεβ": "February",
+            "Μαρτίου": "March", "Μαρ": "March",
+            "Απριλίου": "April", "Απρ": "April",
+            "Μαΐου": "May", "Μάι": "May",
+            "Ιουνίου": "June", "Ιουν": "June",
+            "Ιουλίου": "July", "Ιουλ": "July",
+            "Αυγούστου": "August", "Αυγ": "August",
+            "Σεπτεμβρίου": "September", "Σεπ": "September",
+            "Οκτωβρίου": "October", "Οκτ": "October",
+            "Νοεμβρίου": "November", "Νοε": "November",
+            "Δεκεμβρίου": "December", "Δεκ": "December",
         }
 
-        # English month mapping
         english_months = {
-            "January": "01",
-            "February": "02",
-            "March": "03",
-            "April": "04",
-            "May": "05",
-            "June": "06",
-            "July": "07",
-            "August": "08",
-            "September": "09",
-            "October": "10",
-            "November": "11",
-            "December": "12",
-            "Jan": "01",
-            "Feb": "02",
-            "Mar": "03",
-            "Apr": "04",
-            "Jun": "06",
-            "Jul": "07",
-            "Aug": "08",
-            "Sep": "09",
-            "Oct": "10",
-            "Nov": "11",
-            "Dec": "12",
+            "January": "01", "February": "02", "March": "03",
+            "April": "04", "May": "05", "June": "06",
+            "July": "07", "August": "08", "September": "09",
+            "October": "10", "November": "11", "December": "12",
+            "Jan": "01", "Feb": "02", "Mar": "03",
+            "Apr": "04", "Jun": "06", "Jul": "07",
+            "Aug": "08", "Sep": "09", "Oct": "10",
+            "Nov": "11", "Dec": "12",
         }
 
-        # Replace Greek months with English
         for greek, english in greek_months.items():
             date_text = date_text.replace(greek, english)
 
-        # Remove English day names too
         english_days = [
-            "Monday",
-            "Tuesday",
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-            "Sunday",
+            "Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday"
         ]
         for day in english_days:
             date_text = date_text.replace(day + ",", "").replace(day, "")
 
-        # Clean up the date text
         date_text = date_text.strip().replace(",", "")
 
-        # Parse different date formats
         parts = date_text.split()
         if len(parts) >= 3:
             day = parts[0]
             month = parts[1]
             year = parts[2]
 
-            # Convert month name to number
             month_num = english_months.get(month, month)
 
-            # Parse time - Default ώρα 21:15 αν δεν υπάρχει ή είναι σκορ
             time = time_text.strip()
             if not time or ":" not in time or len(time) > 5:
                 time = "21:15"
 
-            # Parse datetime
             datetime_str = f"{day}/{month_num}/{year} {time}"
             match_datetime = datetime.strptime(datetime_str, "%d/%m/%Y %H:%M")
 
@@ -339,19 +279,12 @@ def add_or_update_match(service, match_data, existing_calendar_events):
             logger.warning(f"Παράλειψη αγώνα λόγω σφάλματος ημερομηνίας: {match_data['home_team']} vs {match_data['away_team']}")
             return None
 
-        # Create unique key for this match
         match_key = create_match_key(match_data, match_datetime)
-
-        # Διάρκεια 2 ώρες (ώστε να μην ξεπερνά την ημέρα)
         end_datetime = match_datetime + timedelta(hours=2)
 
-        # Emoji ☘️🏀 στον τίτλο + ημερομηνία για μοναδικότητα
         date_str = match_datetime.strftime("%d/%m")
-        summary = (
-            f"☘️🏀 {match_data['home_team']} - {match_data['away_team']} [{date_str}]"
-        )
+        summary = f"☘️🏀 {match_data['home_team']} - {match_data['away_team']} [{date_str}]"
 
-        # Check if this exact match already exists in calendar
         event_to_update = None
         for existing in existing_calendar_events:
             existing_summary = existing.get("summary", "")
@@ -366,19 +299,14 @@ def add_or_update_match(service, match_data, existing_calendar_events):
                 )
                 existing_dt = existing_dt.replace(tzinfo=None)
 
-                # Same date? Then it's the same match
                 if existing_dt.date() == match_datetime.date():
-                    # Check if time changed
                     if existing_dt.time() == match_datetime.time():
-                        # Same time - no update needed
                         logger.debug(f"ℹ️ Υπάρχει ήδη: {summary}")
                         return match_key
                     else:
-                        # Time changed - need to update
                         event_to_update = existing
                         break
 
-        # Create event data
         event = {
             "summary": summary,
             "location": match_data["venue"],
@@ -400,7 +328,6 @@ def add_or_update_match(service, match_data, existing_calendar_events):
         }
 
         if event_to_update:
-            # Update existing event
             existing_time = datetime.fromisoformat(
                 event_to_update["start"]["dateTime"].replace("Z", "+00:00")
             ).strftime("%H:%M")
@@ -408,13 +335,14 @@ def add_or_update_match(service, match_data, existing_calendar_events):
                 calendarId=CALENDAR_ID, eventId=event_to_update["id"], body=event
             ).execute()
             logger.info(
-                f"🔄 ΕΝΗΜΕΡΩΣΗ: {match_data['home_team']} vs {match_data['away_team']} ({existing_time} → {match_datetime.strftime('%H:%M')})"
+                f"🔄 ΕΝΗΜΕΡΩΣΗ: {match_data['home_team']} vs {match_data['away_team']} "
+                f"({existing_time} → {match_datetime.strftime('%H:%M')})"
             )
         else:
-            # Insert new event
             service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
             logger.info(
-                f"✅ ΠΡΟΣΘΗΚΗ: {match_data['home_team']} vs {match_data['away_team']} ({match_datetime.strftime('%d/%m/%Y %H:%M')})"
+                f"✅ ΠΡΟΣΘΗΚΗ: {match_data['home_team']} vs {match_data['away_team']} "
+                f"({match_datetime.strftime('%d/%m/%Y %H:%M')})"
             )
 
         return match_key
@@ -427,12 +355,13 @@ def add_or_update_match(service, match_data, existing_calendar_events):
 def get_all_pao_events(service):
     """Get all PAO basketball events from calendar"""
     try:
-        # Get events from 6 months ago to 18 months in the future
-        # This covers the entire basketball season
         time_min = (datetime.now() - timedelta(days=180)).isoformat() + "Z"
         time_max = (datetime.now() + timedelta(days=540)).isoformat() + "Z"
 
-        logger.info(f"Αναζήτηση events από {(datetime.now() - timedelta(days=180)).strftime('%d/%m/%Y')} έως {(datetime.now() + timedelta(days=540)).strftime('%d/%m/%Y')}")
+        logger.info(
+            f"Αναζήτηση events από {(datetime.now() - timedelta(days=180)).strftime('%d/%m/%Y')} "
+            f"έως {(datetime.now() + timedelta(days=540)).strftime('%d/%m/%Y')}"
+        )
 
         events_result = (
             service.events()
@@ -449,11 +378,9 @@ def get_all_pao_events(service):
 
         all_events = events_result.get("items", [])
 
-        # Filter only PAO basketball events (with ☘️🏀 or basketball teams)
         pao_events = []
         for event in all_events:
             summary = event.get("summary", "")
-            # Check if it's a basketball event (has emoji or team names)
             if (
                 "🏀" in summary
                 or "ΠΑΟ" in summary.upper()
@@ -481,12 +408,9 @@ def delete_obsolete_events(service, valid_match_keys, calendar_events):
             if not existing_start:
                 continue
 
-            # Parse teams from summary
-            # Format: "☘️🏀 TEAM1 - TEAM2 [dd/mm]"
             if " - " in summary:
                 teams_part = summary.replace("☘️", "").replace("🏀", "").strip()
 
-                # Remove date part [dd/mm] if exists
                 if "[" in teams_part:
                     teams_part = teams_part.split("[")[0].strip()
 
@@ -495,24 +419,21 @@ def delete_obsolete_events(service, valid_match_keys, calendar_events):
                     home_team = parts[0].strip()
                     away_team = parts[1].strip()
 
-                    # Get date
                     existing_dt = datetime.fromisoformat(
                         existing_start.replace("Z", "+00:00")
                     )
                     existing_dt = existing_dt.replace(tzinfo=None)
                     date_str = existing_dt.strftime("%Y-%m-%d")
 
-                    # Create key
                     event_key = f"{home_team}|{away_team}|{date_str}"
 
-                    # Check if this event is in valid matches
                     if event_key not in valid_match_keys:
-                        # Delete this event
                         service.events().delete(
                             calendarId=CALENDAR_ID, eventId=event["id"]
                         ).execute()
                         logger.info(
-                            f"🗑️ ΔΙΑΓΡΑΦΗ: {home_team} vs {away_team} ({existing_dt.strftime('%d/%m/%Y')}) - δεν υπάρχει πια στο site"
+                            f"🗑️ ΔΙΑΓΡΑΦΗ: {home_team} vs {away_team} "
+                            f"({existing_dt.strftime('%d/%m/%Y')}) - δεν υπάρχει πια στο site"
                         )
                         deleted_count += 1
 
@@ -524,12 +445,12 @@ def delete_obsolete_events(service, valid_match_keys, calendar_events):
 
 
 def main():
-    """Main function with 2-phase sync"""
+    """Main function with 3-phase sync"""
     logger.info("=" * 70)
     logger.info("🏀 Panathinaikos BC Schedule Scraper - Έναρξη")
     logger.info("=" * 70)
 
-    # Authenticate Google Calendar
+    # Authenticate Google Calendar with Service Account
     service = authenticate_google_calendar()
 
     # PHASE 0: Get existing calendar events
@@ -551,8 +472,6 @@ def main():
     logger.info("-" * 70)
 
     processed_count = 0
-    added_count = 0
-    updated_count = 0
     valid_match_keys = set()
 
     for match in matches:

@@ -1,5 +1,20 @@
-token.pickle
-__pycache__/
+# Credentials & Authentication
+service-account-key.json
 credentials.json
-.env
+token.pickle
 token.json
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
