@@ -18,3 +18,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+clean_calendar.py
+test_sync.py
+pao_scraper - Copy.pyservice-account-key.json
