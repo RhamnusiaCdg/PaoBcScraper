@@ -31,7 +31,7 @@ jobs:
     - name: Run PAO BC Scraper
       env:
         SERVICE_ACCOUNT_KEY: ${{ secrets.SERVICE_ACCOUNT_KEY }}
-        CALENDAR_ID: primary
+        CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
       run: |
         python pao_scraper.py
     
